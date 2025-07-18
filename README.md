@@ -161,7 +161,7 @@ Our code is built upon several repository:
 
 
 ## Star Histroy
-[![Star History Chart](https://api.star-history.com/svg?repos=Intelligent-Computing-Lab-Yale/GPTQv2&type=Date)](https://star-history.com/#Intelligent-Computing-Lab-Yale/GPTQv2)
+[![Star History Chart](https://api.star-history.com/svg?repos=Intelligent-Computing-Lab-Yale/GPTAQ&type=Date)](https://star-history.com/#Intelligent-Computing-Lab-Yale/GPTAQ)
 
 ## Contact
 
