@@ -149,7 +149,10 @@ def parser_gen():
     parser.add_argument('--requant', action=argparse.BooleanOptionalAction, default=False,
                         help='Apply ReQuant after the PTQ initializer (Algorithm 1).')
     parser.add_argument('--requant_sweeps', type=int, default=4,
-                        help='Number of coordinate sweeps T (paper default: 4).')
+                        help='Number of coordinate sweeps T (paper default: 4). '
+                             'T=0 collects and reports H/B/C without updating any '
+                             'weight, which measures the activation drift the '
+                             'initializer alone produces.')
     parser.add_argument('--requant_neighborhood', type=int, default=2,
                         help='Neighborhood size K (paper default: 2).')
     parser.add_argument('--requant_fp_branch', type=str, default='true_fp',
@@ -263,7 +266,7 @@ def parser_gen():
         assert args.w_bits < 16, 'ReQuant requires quantized weights (w_bits < 16).'
         if args.w_format == 'int':
             assert args.w_groupsize == -1, 'ReQuant INT path only supports per-channel weights (w_groupsize=-1).'
-        assert args.requant_sweeps >= 1, 'requant_sweeps T must be >= 1.'
+        assert args.requant_sweeps >= 0, 'requant_sweeps T must be >= 0.'
         assert args.requant_neighborhood >= 1, 'requant_neighborhood K must be >= 1.'
     if not args.w_rtn and args.w_format == 'nvfp4' and args.w_bits < 16:
         raise NotImplementedError('NVFP4 currently supports RTN only (--w_rtn).')

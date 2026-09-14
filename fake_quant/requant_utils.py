@@ -293,6 +293,15 @@ class ReQuant:
         self.input_sq = 0.0
 
     def add_batch(self, inp, fp_inp):
+        """Accumulate H̃, B and C for one batch.
+
+        inp is the quantized-branch input as the module sees it, [.., tokens,
+        dcol]; fp_inp is the full-precision input already transposed to
+        [dcol, tokens] by _cache_fp_input. The layout of fp_inp is fixed by that
+        contract rather than inferred, because a square [dcol, tokens] block
+        (Qwen3-1.7B at seqlen 2048 has dcol == tokens == 2048) would make any
+        shape-based guess silently pick X̃^T.
+        """
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
@@ -301,12 +310,9 @@ class ReQuant:
         inp = inp.t()
         x_fp = fp_inp
         if x_fp.shape != inp.shape:
-            if x_fp.t().shape == inp.shape:
-                x_fp = x_fp.t()
-            elif x_fp.numel() == inp.numel():
-                x_fp = x_fp.reshape(inp.shape)
-            else:
-                raise ValueError(f'FP/quant activation shape mismatch {x_fp.shape} vs {inp.shape}')
+            raise ValueError(
+                f'fp_inp must be [dcol, tokens] = {tuple(inp.shape)}, got {tuple(x_fp.shape)}'
+            )
 
         self.H *= self.nsamples / (self.nsamples + tmp)
         self.B *= self.nsamples / (self.nsamples + tmp)

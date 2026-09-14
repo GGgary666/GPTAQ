@@ -169,6 +169,37 @@ class ReQuantTests(unittest.TestCase):
         self.assertTrue(torch.allclose(rq.B, B, atol=1e-5))
         self.assertTrue(torch.allclose(rq.C, C, atol=1e-5))
 
+    def test_hook_and_add_batch_agree_when_square(self):
+        """dcol == tokens must not let the fp/quant layout be guessed wrongly.
+
+        Qwen3-1.7B at seqlen 2048 hits this exactly, and X̃^T would pass any
+        shape check while producing a completely different B.
+        """
+        dcol = tokens = 6
+        layer = torch.nn.Linear(dcol, 4, bias=False)
+        cache = {'m': []}
+        hook = requant_utils._cache_fp_input(cache, 'm')
+        x_fp = torch.randn(1, tokens, dcol)
+        hook(layer, (x_fp,), None)
+        x_q = x_fp + 0.2 * torch.randn(1, tokens, dcol)
+
+        rq = requant_utils.ReQuant(layer)
+        rq.add_batch(x_q, cache['m'][0])
+
+        s = math.sqrt(2 / 1)
+        xq = s * x_q.reshape(-1, dcol).t()
+        xf = s * x_fp.reshape(-1, dcol).t()
+        self.assertTrue(torch.allclose(rq.B, (xq - xf) @ xq.t(), atol=1e-5))
+        # The transposed input is a different matrix, so the test has teeth.
+        self.assertFalse(torch.allclose(rq.B, (xq - xf.t()) @ xq.t(), atol=1e-5))
+
+    def test_add_batch_rejects_untransposed_fp_input(self):
+        dcol, tokens = 5, 7
+        layer = torch.nn.Linear(dcol, 3, bias=False)
+        rq = requant_utils.ReQuant(layer)
+        with self.assertRaises(ValueError):
+            rq.add_batch(torch.randn(1, tokens, dcol), torch.randn(tokens, dcol))
+
     def test_generalizes_only_with_enough_calibration_tokens(self):
         """Refinement must beat RTN on held-out data once H̃ is well conditioned.
 
