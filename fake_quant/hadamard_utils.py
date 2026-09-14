@@ -1,5 +1,8 @@
 import torch, math
-import fast_hadamard_transform
+try:
+    import fast_hadamard_transform as _fht
+except ImportError:
+    _fht = None
 # Adapted from https://github.com/Cornell-RelaxML/quip-sharp/blob/main/lib/utils/matmul_had.py
 
 def get_hadK(n, transpose=False):
@@ -48,6 +51,9 @@ def get_hadK(n, transpose=False):
         assert (is_pow2(n // 12))
         K = 12
         hadK = get_had12().T if transpose else get_had12()
+    elif n % 68 == 0 and is_pow2(n // 68):  # qwen3-14b intermediate
+        K = 68
+        hadK = get_hadPaley(68).T if transpose else get_hadPaley(68)
     else:
         assert (is_pow2(n))
         K = 1
@@ -58,7 +64,7 @@ def get_hadK(n, transpose=False):
 def matmul_hadU(X, transpose=False):
     n = X.shape[-1]
     hadK, K = get_hadK(n, transpose)
-    input = X.clone().view(-1, n, 1)
+    input = X.contiguous().reshape(-1, n, 1).clone()
     output = input.clone()
     while input.shape[1] > K:
         input = input.view(input.shape[0], input.shape[1] // 2, 2, input.shape[2])
@@ -89,14 +95,27 @@ def random_hadamard_matrix(size, device):
     Q = torch.diag(Q)
     return matmul_hadU(Q).to(device)
 
+def hadamard_transform(X, scale=1.0):
+    """Hadamard on the last dimension. Matches fast_hadamard_transform.hadamard_transform."""
+    if _fht is not None:
+        return _fht.hadamard_transform(X.contiguous(), scale)
+    n = X.shape[-1]
+    y = matmul_hadU(X.float().contiguous())
+    default_scale = 1.0 / math.sqrt(n)
+    scale_f = scale.item() if torch.is_tensor(scale) else float(scale)
+    return (y * (scale_f / default_scale)).to(dtype=X.dtype)
+
+
 def matmul_hadU_cuda(X, hadK, K):
     n = X.shape[-1]
+    if _fht is None:
+        return matmul_hadU(X)
     if K == 1:
-        return fast_hadamard_transform.hadamard_transform(X.contiguous(), 1.0/torch.tensor(n).sqrt()) 
+        return _fht.hadamard_transform(X.contiguous(), 1.0/torch.tensor(n).sqrt())
     # if transpose:
     #     hadK = hadK.T.contiguous()
     input = X.view(-1, K, n // K)
-    input = fast_hadamard_transform.hadamard_transform(input.contiguous(), 1.0/torch.tensor(n).sqrt())
+    input = _fht.hadamard_transform(input.contiguous(), 1.0/torch.tensor(n).sqrt())
     input = hadK.to(input.device).to(input.dtype) @ input
     return input.reshape(X.shape)
 
@@ -130,8 +149,8 @@ def apply_exact_had_to_linear(module, had_dim=-1, output=False):
         if output:
             W_ = W_.t()
             transposed_shape = W_.shape
-            W_ = fast_hadamard_transform.hadamard_transform(
-                W_.reshape(-1, transposed_shape[-1]//had_dim, had_dim), 
+            W_ = hadamard_transform(
+                W_.reshape(-1, transposed_shape[-1]//had_dim, had_dim).contiguous(),
                 scale=1/math.sqrt(had_dim)
                 ).reshape(transposed_shape).t()
         else:
@@ -144,6 +163,38 @@ def apply_exact_had_to_linear(module, had_dim=-1, output=False):
 
 def is_pow2(n):
     return (n & (n - 1) == 0) and (n > 0)
+
+
+_PALEY_CACHE = {}
+
+
+def get_hadPaley(n):
+    """Paley construction I: H = I + S of order n = q+1, for prime q = 3 (mod 4).
+
+    Sloane's tabulated matrices below stop at 172 and skip 68, which leaves
+    Qwen3-14B's intermediate_size (17408 = 68 x 2^8) with no factorization.
+    """
+    H = _PALEY_CACHE.get(n)
+    if H is not None:
+        return H
+    q = n - 1
+    assert q > 2 and all(q % d for d in range(2, int(math.isqrt(q)) + 1)), \
+        f'Paley I needs prime q = {q}'
+    assert q % 4 == 3, f'Paley I needs q = 3 (mod 4), got {q}'
+    residues = {(i * i) % q for i in range(1, q)}
+    chi = torch.zeros(q)
+    for a in range(1, q):
+        chi[a] = 1.0 if a in residues else -1.0
+    idx = torch.arange(q)
+    # Jacobsthal Q[i, j] = chi(j - i); skew-symmetric because q = 3 (mod 4).
+    S = torch.zeros(n, n)
+    S[0, 1:] = 1.0
+    S[1:, 0] = -1.0
+    S[1:, 1:] = chi[(idx.unsqueeze(0) - idx.unsqueeze(1)) % q]
+    H = torch.eye(n) + S
+    assert torch.equal(H @ H.t(), n * torch.eye(n)), f'Paley order {n} is not Hadamard'
+    _PALEY_CACHE[n] = H
+    return H
 
 
 # hadamard matrices for had12, had36.pal2, had52,will, 

@@ -128,7 +128,8 @@ class GPTAQ:
 
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:]) - W1.matmul(P[i1:i2, i2:])
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         if actorder:
             Q = Q[:, invperm]
@@ -163,7 +164,7 @@ def gptaq_fwrd(model, dataloader, dev, args):
 
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     model.model.norm = model.model.norm.to(dev)
-    # model.model.rotary_emb = model.model.rotary_emb.to(dev)
+    model_utils.maybe_move_rotary(model, dev)
 
     layers[0] = layers[0].to(dev)
 
@@ -172,7 +173,7 @@ def gptaq_fwrd(model, dataloader, dev, args):
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
 
-    cache = {'i': 0, 'attention_mask': None}
+    cache = {'i': 0, 'layer_kwargs': {}}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -182,8 +183,7 @@ def gptaq_fwrd(model, dataloader, dev, args):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['layer_kwargs'] = kwargs
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -200,9 +200,7 @@ def gptaq_fwrd(model, dataloader, dev, args):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
+    layer_kwargs = cache['layer_kwargs']
 
     quantizers = {}
     sequential = [
@@ -224,7 +222,9 @@ def gptaq_fwrd(model, dataloader, dev, args):
         fp_inputs_cache.add_hook(full)
 
         for j in range(args.nsamples):
-            fp_inps[j] = layer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            fp_inps[j] = model_utils.forward_decoder_layer(
+                layer, fp_inps[j].unsqueeze(0), layer_kwargs, model
+            )
         fp_inputs_cache.clear_hook()
         quant_utils.enable_act_quant(layer, bits_config)
 
@@ -258,7 +258,9 @@ def gptaq_fwrd(model, dataloader, dev, args):
             handle = subset[first_module_name].register_forward_hook(add_batch(first_module_name))
 
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = model_utils.forward_decoder_layer(
+                    layer, inps[j].unsqueeze(0), layer_kwargs, model
+                )
             handle.remove()
 
             # copy H and dXXT
@@ -277,7 +279,9 @@ def gptaq_fwrd(model, dataloader, dev, args):
                 gptq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = model_utils.forward_decoder_layer(
+                layer, inps[j].unsqueeze(0), layer_kwargs, model
+            )
 
         fp_inputs_cache.clear_cache()
         layers[i] = layer.cpu()

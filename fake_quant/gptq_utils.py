@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import utils
 import quant_utils
+import model_utils
+import nvfp4_utils
 import logging
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -116,7 +118,8 @@ class GPTQ:
 
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         if actorder:
             Q = Q[:, invperm]
@@ -150,13 +153,14 @@ def gptq_fwrd(model, dataloader, dev, args):
 
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     model.model.norm = model.model.norm.to(dev)
+    model_utils.maybe_move_rotary(model, dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None}
+    cache = {'i': 0, 'layer_kwargs': {}}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -165,8 +169,7 @@ def gptq_fwrd(model, dataloader, dev, args):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['layer_kwargs'] = kwargs
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -183,8 +186,7 @@ def gptq_fwrd(model, dataloader, dev, args):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
+    layer_kwargs = cache['layer_kwargs']
 
     quantizers = {}
     sequential = [
@@ -224,7 +226,9 @@ def gptq_fwrd(model, dataloader, dev, args):
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = model_utils.forward_decoder_layer(
+                    layer, inps[j].unsqueeze(0), layer_kwargs, model
+                )
             for h in handles:
                 h.remove()
 
@@ -237,7 +241,9 @@ def gptq_fwrd(model, dataloader, dev, args):
                 gptq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = model_utils.forward_decoder_layer(
+                layer, inps[j].unsqueeze(0), layer_kwargs, model
+            )
 
         layers[i] = layer.cpu()
         del layer
@@ -260,7 +266,11 @@ def rtn_fwrd(model, dev, args):
     From GPTQ repo 
     TODO: Make this function general to support both OPT and LLaMA models
     '''
-    assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
+    w_format = getattr(args, 'w_format', 'int')
+    if w_format == 'int':
+        assert args.w_groupsize == -1, "Groupsize not supported in RTN!"
+    elif w_format != 'nvfp4':
+        raise ValueError(f'Unknown w_format {w_format}')
     layers = model.model.layers
     torch.cuda.empty_cache()
 
@@ -280,12 +290,18 @@ def rtn_fwrd(model, dev, args):
             if args.int8_down_proj and 'down_proj' in name:
                 layer_weight_bits = 8
 
-            quantizer = quant_utils.WeightQuantizer()
-            quantizer.configure(
-                layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip
-            )
             W = subset[name].weight.data
-            quantizer.find_params(W)
+            if w_format == 'nvfp4':
+                if layer_weight_bits != 4:
+                    raise ValueError('NVFP4 RTN requires --w_bits 4')
+                quantizer = nvfp4_utils.NVFP4WeightQuantizer()
+                quantizer.find_params(W)
+            else:
+                quantizer = quant_utils.WeightQuantizer()
+                quantizer.configure(
+                    layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip
+                )
+                quantizer.find_params(W)
             subset[name].weight.data = quantizer.quantize(W).to(
                 next(iter(layer.parameters())).dtype)
             quantizers['model.layers.%d.%s' % (i, name)] = quantizer.cpu()

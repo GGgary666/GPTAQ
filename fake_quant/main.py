@@ -7,6 +7,7 @@ import quant_utils
 import rotation_utils
 import gptq_utils
 import gptaq_utils
+import requant_utils
 import eval_utils
 import hadamard_utils
 
@@ -16,7 +17,7 @@ def add_aq(model, args):
     if args.a_bits < 16 or args.v_bits < 16:
         qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
         down_proj_groupsize = -1
-        if args.a_groupsize > 0 and "llama" in args.model:
+        if args.a_groupsize > 0 and model_utils.is_llama_like_name(args.model):
             down_proj_groupsize = utils.llama_down_proj_groupsize(model, args.a_groupsize)
 
         for name in qlayers:
@@ -39,10 +40,16 @@ def add_aq(model, args):
                     layer_input_bits = 8
                 layer_groupsize = down_proj_groupsize
 
+            if args.a_format == 'nvfp4' and layer_input_bits < 16:
+                layer_input_bits = 4
+                layer_groupsize = 16
+                layer_a_sym = True
             qlayers[name].quantizer.configure(bits=layer_input_bits,
                                               groupsize=layer_groupsize,
                                               sym=layer_a_sym,
-                                              clip_ratio=layer_a_clip)
+                                              clip_ratio=layer_a_clip,
+                                              per_tensor=args.a_per_tensor,
+                                              format=args.a_format if layer_input_bits < 16 else 'int')
 
     if args.k_bits < 16:
         if args.k_pre_rope:
@@ -60,6 +67,16 @@ def add_aq(model, args):
                             **k_quant_config)
 
 
+def _get_cal_loader(args, model):
+    return data_utils.get_loaders(
+        args.cal_dataset, nsamples=args.nsamples,
+        seed=args.seed, model=args.model,
+        seqlen=model.seqlen, eval_mode=False,
+        hf_token=args.hf_token,
+        dataset_dir=args.dataset_dir,
+    )
+
+
 def main():
     args = utils.parser_gen()
     if args.wandb:
@@ -70,6 +87,8 @@ def main():
     transformers.set_seed(args.seed)
     model = model_utils.get_model(args.model, args.hf_token)
     model.eval()
+    if args.seqlen is not None:
+        model.seqlen = int(args.seqlen)
 
     # Rotate the weights
     if args.rotate:
@@ -79,6 +98,9 @@ def main():
             
         quant_utils.add_actquant(model) #Add Activation Wrapper to the model
         qlayers = quant_utils.find_qlayers(model)
+        head_dim = getattr(model.config, 'head_dim', None) or (
+            model.config.hidden_size // model.config.num_attention_heads
+        )
         for name in qlayers:
             if 'down_proj' in name:
                 had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
@@ -91,14 +113,19 @@ def main():
                 qlayers[name].online_partial_had = True
                 qlayers[name].had_K = had_K
                 qlayers[name].K = K
-                qlayers[name].had_dim = model.config.hidden_size//model.config.num_attention_heads
+                qlayers[name].had_dim = head_dim
                 qlayers[name].fp32_had = args.fp32_had
     else:
         quant_utils.add_actquant(model) #Add Activation Wrapper to the model as the rest of the code assumes it is present
 
+    fp_weights = None
+    if args.requant:
+        fp_weights = requant_utils.snapshot_linear_weights(model)
+
     if args.enable_aq_calibration:
         add_aq(model, args)
 
+    quantizers = None
     if args.w_bits < 16:
         save_dict = {}
         if args.load_qmodel_path: # Load Quantized Rotated Model
@@ -107,15 +134,12 @@ def main():
             print("Load quantized model from ", args.load_qmodel_path)
             save_dict = torch.load(args.load_qmodel_path)
             model.load_state_dict(save_dict["model"], strict=False)
+            quantizers = save_dict.get("w_quantizers")
             
         elif not args.w_rtn: # GPTQ Weight Quantization
-            assert "llama" in args.model, "Only llama is supported for GPTQ!"
+            assert model_utils.is_llama_like_name(args.model), "Only Llama/Qwen is supported for GPTQ!"
             
-            trainloader = data_utils.get_loaders(
-                args.cal_dataset, nsamples=args.nsamples,
-                seed=args.seed, model=args.model,
-                seqlen=model.seqlen, eval_mode=False
-            )
+            trainloader = _get_cal_loader(args, model)
             if args.asym_calibrate:
                 quantizers = gptaq_utils.gptaq_fwrd(model, trainloader, utils.DEV, args)
                 save_dict["w_quantizers"] = quantizers
@@ -125,6 +149,14 @@ def main():
         else: # RTN Weight Quantization
             quantizers = gptq_utils.rtn_fwrd(model, utils.DEV, args)
             save_dict["w_quantizers"] = quantizers
+
+        if args.requant:
+            if quantizers is None:
+                raise RuntimeError('ReQuant needs the initializer quantizers (scale/zero).')
+            trainloader = _get_cal_loader(args, model)
+            requant_utils.requant_fwrd(
+                model, trainloader, utils.DEV, args, quantizers, fp_weights
+            )
             
         if args.save_qmodel_path:
             save_dict["model"] = model.state_dict()
@@ -140,7 +172,8 @@ def main():
             model=args.model,
             seqlen=model.seqlen,
             hf_token=args.hf_token,
-            eval_mode=True
+            eval_mode=True,
+            dataset_dir=args.dataset_dir,
         )
 
     dataset_ppl = eval_utils.evaluator(model, testloader, utils.DEV, args)
@@ -162,7 +195,10 @@ def main():
     else:
         model.to(utils.DEV)
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, use_fast=False, use_auth_token=args.hf_token)
+    tok_kwargs = {'use_fast': False}
+    if args.hf_token:
+        tok_kwargs['token'] = args.hf_token
+    tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, **tok_kwargs)
     hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.lm_eval_batch_size)
 
     # commenting out this line as it will include two lambda sub-tasks

@@ -10,22 +10,111 @@ OPT_MODEL = transformers.models.opt.modeling_opt.OPTForCausalLM
 OPT_LAYER = transformers.models.opt.modeling_opt.OPTDecoderLayer
 LLAMA_MODEL = transformers.models.llama.modeling_llama.LlamaForCausalLM
 LLAMA_LAYER = transformers.models.llama.modeling_llama.LlamaDecoderLayer
+try:
+    from transformers.models.qwen3.modeling_qwen3 import (
+        Qwen3ForCausalLM,
+        Qwen3DecoderLayer,
+        Qwen3RMSNorm,
+    )
+    QWEN3_MODEL = Qwen3ForCausalLM
+    QWEN3_LAYER = Qwen3DecoderLayer
+    QWEN3_RMSNORM = Qwen3RMSNorm
+except Exception:  # transformers without Qwen3
+    QWEN3_MODEL = type('Qwen3ForCausalLMUnavailable', (), {})
+    QWEN3_LAYER = type('Qwen3DecoderLayerUnavailable', (), {})
+    QWEN3_RMSNORM = type('Qwen3RMSNormUnavailable', (), {})
+
+
+def is_llama_like_type(model_type):
+    return model_type in (LLAMA_MODEL, QWEN3_MODEL)
+
+
+def is_llama_like_name(name: str) -> bool:
+    n = name.lower()
+    return any(key in n for key in ('llama', 'qwen', 'meta'))
 
 
 def model_type_extractor(model):
     if isinstance(model, LLAMA_MODEL):
         return LLAMA_MODEL
-    elif isinstance(model, OPT_MODEL):
+    if isinstance(model, QWEN3_MODEL):
+        return QWEN3_MODEL
+    if isinstance(model, OPT_MODEL):
         return OPT_MODEL
-    else:
-        raise ValueError(f'Unknown model type {model}')
+    raise ValueError(f'Unknown model type {model}')
+
+
+def unpack_layer_output(out):
+    """transformers 5.x decoder layers may return a bare tensor, not a tuple."""
+    if isinstance(out, torch.Tensor):
+        return out
+    return out[0]
+
+
+def maybe_move_rotary(model, device):
+    if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
+        model.model.rotary_emb = model.model.rotary_emb.to(device)
+
+
+def _align_layer_kwargs(layer_kwargs, hidden_states):
+    kwargs = {}
+    if not layer_kwargs:
+        return kwargs
+    batch = hidden_states.shape[0]
+    device = hidden_states.device
+    for key, value in layer_kwargs.items():
+        if key == 'position_embeddings':
+            continue
+        if torch.is_tensor(value):
+            value = value.to(device)
+            if value.dim() >= 1 and value.shape[0] == 1 and batch != 1:
+                value = value.expand(batch, *value.shape[1:])
+            elif value.dim() >= 1 and value.shape[0] != batch and value.shape[0] > batch:
+                value = value[:batch]
+            kwargs[key] = value
+        else:
+            kwargs[key] = value
+    return kwargs
+
+
+def forward_decoder_layer(layer, hidden_states, layer_kwargs=None, model=None):
+    kwargs = _align_layer_kwargs(layer_kwargs, hidden_states)
+    if model is not None and hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
+        position_ids = kwargs.get('position_ids')
+        if position_ids is not None:
+            kwargs['position_embeddings'] = model.model.rotary_emb(hidden_states, position_ids)
+    return unpack_layer_output(layer(hidden_states, **kwargs))
+
+
+def _from_pretrained(loader, model_name, hf_token=None, **kwargs):
+    if hf_token:
+        kwargs['token'] = hf_token
+    return loader(model_name, **kwargs)
+
+
+def untie_word_embeddings(model):
+    """Clone lm_head.weight when it shares storage with embed_tokens.
+
+    QuaRot rotates embeddings and the head separately (W @ Q). If they are
+    the same Parameter, the rotation is applied twice.
+    """
+    if not getattr(model.config, 'tie_word_embeddings', False):
+        return
+    embed = model.get_input_embeddings()
+    lm_head = model.get_output_embeddings()
+    if embed is None or lm_head is None:
+        return
+    if embed.weight.data_ptr() == lm_head.weight.data_ptr():
+        lm_head.weight = torch.nn.Parameter(embed.weight.detach().clone())
+    model.config.tie_word_embeddings = False
+    logging.info('---> Untied word embeddings (lm_head is now an independent Parameter)')
 
 def skip(*args, **kwargs):
     # This is a helper function to save time during the initialization! 
     pass
 
 def get_rope_function_name(model):
-    if isinstance(model, LLAMA_MODEL):
+    if is_llama_like_type(model_type_extractor(model)):
         return "apply_rotary_pos_emb"
     raise NotImplementedError
 
@@ -33,7 +122,7 @@ def get_rope_function_name(model):
 def get_layers(model):
     if isinstance(model, OPT_MODEL):
         return model.model.decoder.layers
-    if isinstance(model, LLAMA_MODEL):
+    if is_llama_like_type(model_type_extractor(model)):
         return model.model.layers
     raise NotImplementedError
 
@@ -42,13 +131,34 @@ def get_llama(model_name, hf_token):
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    model = transformers.LlamaForCausalLM.from_pretrained(model_name, torch_dtype='auto',
-                                                          use_auth_token=hf_token,
-                                                          low_cpu_mem_usage=True)
+    model = _from_pretrained(
+        transformers.LlamaForCausalLM.from_pretrained,
+        model_name,
+        hf_token,
+        torch_dtype='auto',
+        low_cpu_mem_usage=True,
+    )
     model.seqlen = 2048
+    untie_word_embeddings(model)
     logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))
     return model
 
+
+def get_qwen3(model_name, hf_token=None):
+    torch.nn.init.kaiming_uniform_ = skip
+    torch.nn.init.uniform_ = skip
+    torch.nn.init.normal_ = skip
+    model = _from_pretrained(
+        transformers.AutoModelForCausalLM.from_pretrained,
+        model_name,
+        hf_token,
+        torch_dtype='auto',
+        low_cpu_mem_usage=True,
+    )
+    model.seqlen = 2048
+    untie_word_embeddings(model)
+    logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))
+    return model
 
 
 def get_opt(model_name):
@@ -65,25 +175,21 @@ def get_opt(model_name):
 def get_model(
     model_name, hf_token=None
 ):
-    if 'llama' in model_name:
+    name = model_name.lower()
+    if 'qwen' in name:
+        return get_qwen3(model_name, hf_token)
+    if 'llama' in name:
         return get_llama(model_name, hf_token)
-    elif 'opt' in model_name:
+    if 'opt' in name:
         return get_opt(model_name)
-    else:
-        raise ValueError(f'Unknown model {model_name}')
+    raise ValueError(f'Unknown model {model_name}')
 
 
 def get_model_type(model):
-    if isinstance(model, OPT_MODEL):
-        model_type = OPT_MODEL
-    elif isinstance(model, LLAMA_MODEL):
-        model_type = LLAMA_MODEL
-    else:
-        raise ValueError(f'Unknown model type {model}')
-    return model_type
+    return model_type_extractor(model)
 
 def get_embeddings(model, model_type) -> list[torch.nn.Module]:
-    if model_type == LLAMA_MODEL:
+    if is_llama_like_type(model_type):
         return [model.model.embed_tokens]
     elif model_type == OPT_MODEL:
         return [model.model.decoder.embed_tokens, model.model.decoder.embed_positions]
@@ -92,7 +198,7 @@ def get_embeddings(model, model_type) -> list[torch.nn.Module]:
 
 
 def get_transformer_layers(model, model_type):
-    if model_type == LLAMA_MODEL:
+    if is_llama_like_type(model_type):
         return [layer for layer in model.model.layers]
     elif model_type == OPT_MODEL:
         return [layer for layer in model.model.decoder.layers]
@@ -101,28 +207,22 @@ def get_transformer_layers(model, model_type):
 
 
 def get_lm_head(model, model_type):
-    if model_type == LLAMA_MODEL:
+    if is_llama_like_type(model_type) or model_type == OPT_MODEL:
         return model.lm_head
-    elif model_type == OPT_MODEL:
-        return model.lm_head
-    else:
-        raise ValueError(f'Unknown model type {model_type}')
+    raise ValueError(f'Unknown model type {model_type}')
 
 def get_pre_head_layernorm(model, model_type):
-    if model_type == LLAMA_MODEL:
-        pre_head_layernorm = model.model.norm
-        assert isinstance(pre_head_layernorm,
-                          transformers.models.llama.modeling_llama.LlamaRMSNorm)
-    elif model_type == OPT_MODEL:
+    if is_llama_like_type(model_type):
+        return model.model.norm
+    if model_type == OPT_MODEL:
         pre_head_layernorm = model.model.decoder.final_layer_norm
         assert pre_head_layernorm is not None
-    else:
-        raise ValueError(f'Unknown model type {model_type}')
-    return pre_head_layernorm
+        return pre_head_layernorm
+    raise ValueError(f'Unknown model type {model_type}')
 
 def get_mlp_bottleneck_size(model):
     model_type = get_model_type(model)
-    if model_type == LLAMA_MODEL:
+    if is_llama_like_type(model_type):
         return model.config.intermediate_size
     elif model_type == OPT_MODEL:
         return model.config.ffn_dim
@@ -176,7 +276,7 @@ class RMSN(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
-        if x.dtype == torch.float16:
+        if x.dtype in (torch.float16, torch.bfloat16):
             x = x.to(torch.float32)
         variance = x.pow(2).sum(-1, keepdim=True) / self.mean_dim
         x = x * torch.rsqrt(variance + self.eps)
@@ -234,7 +334,7 @@ def capture_layer_io(model_type, layer, layer_input):
 
     handles = []
 
-    if model_type == LLAMA_MODEL:
+    if is_llama_like_type(model_type):
         captured_inputs = {
             'k_proj': [],  # q_proj, v_proj has the same input as k_proj
             'o_proj': [],

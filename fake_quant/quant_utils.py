@@ -3,7 +3,11 @@ import transformers
 import torch
 import utils
 import hadamard_utils
-import fast_hadamard_transform
+import nvfp4_utils
+try:
+    import fast_hadamard_transform
+except ImportError:
+    fast_hadamard_transform = None
 
 def get_minq_maxq(bits, sym):
     if sym:
@@ -90,6 +94,9 @@ class ActQuantizer(torch.nn.Module):
         self.register_buffer('scale', torch.zeros(1))
         self.register_buffer('zero', torch.zeros(1))
         self.bits = 16
+        self.per_tensor = False
+        self.format = 'int'
+        self.global_scale = None
 
     def free(self):
         self.zero = None
@@ -99,6 +106,13 @@ class ActQuantizer(torch.nn.Module):
         x_dtype = x.dtype
         if self.bits == 16:
             return x
+        if self.format == 'nvfp4':
+            return nvfp4_utils.apply_nvfp4_activation(
+                x,
+                global_scale=self.global_scale,
+                group_size=self.groupsize if self.groupsize > 0 else nvfp4_utils.NVFP4_GROUP_SIZE,
+                clip_ratio=self.clip_ratio,
+            ).to(x_dtype)
         elif self.sym:
             return sym_quant_dequant(x, self.scale, self.maxq).to(x_dtype)
         return asym_quant_dequant(x, self.scale, self.zero, self.maxq).to(x_dtype)
@@ -110,12 +124,19 @@ class ActQuantizer(torch.nn.Module):
         else:
             return asym_quant(x, self.scale, self.zero, self.maxq)
 
-    def configure(self, bits, groupsize=-1, sym=False, clip_ratio=1.0):
+    def configure(self, bits, groupsize=-1, sym=False, clip_ratio=1.0, per_tensor=False, format='int'):
         _, self.maxq = get_minq_maxq(bits, sym)
         self.bits = bits
         self.groupsize = groupsize
         self.sym = sym
         self.clip_ratio = clip_ratio
+        self.per_tensor = per_tensor
+        self.format = format
+        if format == 'nvfp4':
+            self.bits = 4
+            self.groupsize = nvfp4_utils.NVFP4_GROUP_SIZE
+            self.sym = True
+            self.per_tensor = False
         assert self.clip_ratio <= 1 and self.clip_ratio > 0, 'Clip ratio should be in (0, 1]'
 
     def find_params_per_token_groupwise(self, x):
@@ -143,11 +164,34 @@ class ActQuantizer(torch.nn.Module):
     def find_params(self, x):
         if self.bits == 16:
             return
+        if getattr(self, 'format', 'int') == 'nvfp4':
+            # Scales are computed inside apply_nvfp4_activation / forward.
+            return
 
         dev = x.device
         self.maxq = self.maxq.to(dev)
 
         init_shape = x.shape
+
+        if getattr(self, 'per_tensor', False):
+            xmin = x.min() * self.clip_ratio
+            xmax = x.max() * self.clip_ratio
+            if self.sym:
+                xmax = torch.maximum(xmin.abs(), xmax)
+                if xmax == 0:
+                    xmax = xmax + 1
+                scale = xmax / self.maxq
+                self.scale = scale.expand_as(x).to(x.dtype)
+                self.zero = torch.zeros_like(self.scale)
+            else:
+                if xmin == 0 and xmax == 0:
+                    xmin = xmin - 1
+                    xmax = xmax + 1
+                scale = (xmax - xmin) / self.maxq
+                zero = torch.round(-xmin / scale)
+                self.scale = scale.expand_as(x).to(x.dtype)
+                self.zero = zero.expand_as(x).to(x.dtype)
+            return
 
         if self.groupsize > 0:
             # group-wise per-token quantization
@@ -205,7 +249,11 @@ class ActQuantWrapper(torch.nn.Module):
     def extra_repr(self) -> str:
         str_ = f'Input Quantizer Bits: {self.quantizer.bits}'
         if self.quantizer.bits < 16:
-            str_ += f' (Asymmetric Per-Token)' if not self.quantizer.sym else f' (Symmetric Per-Token)'
+            if getattr(self.quantizer, 'format', 'int') == 'nvfp4':
+                str_ += ' (NVFP4 E2M1 group-16)'
+            else:
+                gran = 'Per-Tensor' if getattr(self.quantizer, 'per_tensor', False) else 'Per-Token'
+                str_ += f' (Asymmetric {gran})' if not self.quantizer.sym else f' (Symmetric {gran})'
 
         str_ += f'\nOutput Quantizer Bits: {self.out_quantizer.bits}'
         if self.out_quantizer.bits < 16:
@@ -232,8 +280,10 @@ class ActQuantWrapper(torch.nn.Module):
                 
             init_shape = x.shape
             if self.K == 1:
-                x = fast_hadamard_transform.hadamard_transform(x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim).transpose(1, 2),
-                                                               scale=1/math.sqrt(init_shape[-1]//self.had_dim)).transpose(1, 2)
+                x = hadamard_utils.hadamard_transform(
+                    x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim).transpose(1, 2),
+                    scale=1/math.sqrt(init_shape[-1]//self.had_dim)
+                ).transpose(1, 2)
             else:
                 x = (self.had_K.to(x.dtype) @ x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim)) / math.sqrt(init_shape[-1]//self.had_dim)
                 
@@ -259,6 +309,8 @@ class ActQuantWrapper(torch.nn.Module):
 
 class WeightQuantizer(torch.nn.Module):
     '''From GPTQ Repo'''
+
+    format = 'int'
 
     def __init__(self, shape=1):
         super(WeightQuantizer, self).__init__()

@@ -5,8 +5,7 @@ import utils
 import transformers
 import tqdm, math
 import quant_utils
-from hadamard_utils import random_hadamard_matrix, apply_exact_had_to_linear, is_pow2
-from fast_hadamard_transform import hadamard_transform
+from hadamard_utils import random_hadamard_matrix, apply_exact_had_to_linear, is_pow2, hadamard_transform
 
 def fuse_ln_linear(layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]) -> None:
     """
@@ -59,30 +58,37 @@ def fuse_layer_norms(model):
     for layer in layers:
         
         # fuse the input layernorms into the linear layers
-        if model_type == model_utils.LLAMA_MODEL:
-            fuse_ln_linear(layer.post_attention_layernorm, [layer.mlp.up_proj, layer.mlp.gate_proj])    
+        if model_utils.is_llama_like_type(model_type):
+            fuse_ln_linear(layer.post_attention_layernorm, [layer.mlp.up_proj, layer.mlp.gate_proj])
             fuse_ln_linear(layer.input_layernorm, [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj])
         elif model_type == model_utils.OPT_MODEL:
             fuse_ln_linear(layer.self_attn_layer_norm, [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj])
             fuse_ln_linear(layer.final_layer_norm, [layer.fc1])
         else:
             raise ValueError(f'Unknown model type {model_type}')
-            
-            
-    
+
         if model_type == model_utils.OPT_MODEL:
             bake_mean_into_linear(layer.self_attn.out_proj)
             bake_mean_into_linear(layer.fc2)
-                    
-    
+
     fuse_ln_linear(model_utils.get_pre_head_layernorm(**kwargs), [model_utils.get_lm_head(**kwargs)])
-    
-    model_utils.replace_modules(
-        model,
-        transformers.models.llama.modeling_llama.LlamaRMSNorm if model_type == model_utils.LLAMA_MODEL else torch.nn.LayerNorm,
-        lambda _: model_utils.RMSN(model.config.hidden_size),
-        replace_layers=False,
-    )
+
+    # Replace only hidden-size RMSNorms. Qwen3 also has q_norm/k_norm on
+    # head_dim; a type-wide DFS replace would silently corrupt those.
+    if model_utils.is_llama_like_type(model_type):
+        eps = getattr(model.config, 'rms_norm_eps', 1e-5)
+        hidden = model.config.hidden_size
+        for layer in layers:
+            layer.input_layernorm = model_utils.RMSN(hidden, eps=eps)
+            layer.post_attention_layernorm = model_utils.RMSN(hidden, eps=eps)
+        model.model.norm = model_utils.RMSN(hidden, eps=eps)
+    else:
+        model_utils.replace_modules(
+            model,
+            torch.nn.LayerNorm,
+            lambda _: model_utils.RMSN(model.config.hidden_size),
+            replace_layers=False,
+        )
     
 
 def random_orthogonal_matrix(size, device):
@@ -132,7 +138,7 @@ def rotate_attention_inputs(layer, Q, model_type) -> None:
 
 def rotate_attention_output(layer, Q, model_type) -> None:
     # Rotate output matrix of the self-attention layer.
-    if model_type == model_utils.LLAMA_MODEL:
+    if model_utils.is_llama_like_type(model_type):
         W = layer.self_attn.o_proj
     elif model_type == model_utils.OPT_MODEL:
         W = layer.self_attn.out_proj
@@ -148,7 +154,7 @@ def rotate_attention_output(layer, Q, model_type) -> None:
 
 def rotate_mlp_input(layer, Q, model_type):
     # Rotate the MLP input weights.
-    if model_type == model_utils.LLAMA_MODEL:
+    if model_utils.is_llama_like_type(model_type):
         mlp_inputs = [layer.mlp.up_proj, layer.mlp.gate_proj]
     elif model_type == model_utils.OPT_MODEL:
         mlp_inputs = [layer.fc1]
@@ -161,7 +167,7 @@ def rotate_mlp_input(layer, Q, model_type):
     
 def rotate_mlp_output(layer, Q, model_type):
     # Rotate the MLP output weights and bias.
-    if model_type == model_utils.LLAMA_MODEL:
+    if model_utils.is_llama_like_type(model_type):
         W = layer.mlp.down_proj
     elif model_type == model_utils.OPT_MODEL:
         W = layer.fc2
@@ -181,7 +187,6 @@ def matmul_hadU_cuda_had(X, hadK, transpose=False):
     It reshapes X and applies Walsh-Hadamard transform to the last dimension. 
     Then, it will multiply the retult by another hadamard matrix.
     '''
-    from fast_hadamard_transform import hadamard_transform
     from hadamard_utils import get_had172
     n = X.shape[-1]
     K = hadK.shape[-1]
@@ -195,8 +200,7 @@ def matmul_hadU_cuda_had(X, hadK, transpose=False):
         X.shape) 
 
 def rotate_faster_down_proj(layer, model_type, hardK):
-    from fast_hadamard_transform import hadamard_transform
-    if model_type == model_utils.LLAMA_MODEL:
+    if model_utils.is_llama_like_type(model_type):
         W = layer.mlp.down_proj
     else:
         raise ValueError(f'Faster MLP is onlu supported for LLaMa models!')
@@ -215,7 +219,7 @@ def rotate_head(model, Q: torch.Tensor) -> None:
 
 def rotate_ov_proj(layer, model_type, head_num, head_dim):
     v_proj = layer.self_attn.v_proj
-    if model_type == model_utils.LLAMA_MODEL:
+    if model_utils.is_llama_like_type(model_type):
         o_proj = layer.self_attn.o_proj
     elif model_type == model_utils.OPT_MODEL:
         o_proj = layer.self_attn.out_proj
@@ -233,7 +237,7 @@ def rotate_model(model, args):
     config = model.config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
-    head_dim = model_dim // num_heads
+    head_dim = getattr(config, 'head_dim', None) or (model_dim // num_heads)
 
 
     model_type = model_utils.model_type_extractor(model)

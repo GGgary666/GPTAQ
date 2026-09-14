@@ -35,8 +35,15 @@
 *.xml
 *.iml
 *.pyc
+__pycache__/
 ehthumbs.db
 Thumbs.db
+
+# Remote / cluster-specific launch scripts (local only)
+fake_quant/scripts/
+
+# Local experiment outputs
+fake_quant/runs/
 
 # Ignore ImageNet Pre-trained Models #
 ######################################

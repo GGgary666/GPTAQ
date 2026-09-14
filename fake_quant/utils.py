@@ -18,7 +18,9 @@ supported_models = [
             'meta-llama/Meta-Llama-3-8B',
             'meta-llama/Meta-Llama-3-70B',
             'meta-llama/Meta-Llama-3.1-405B',
-            'facebook/opt-125m'
+            'facebook/opt-125m',
+            'Qwen/Qwen3-1.7B',
+            'Qwen/Qwen3-8B',
             ]
 supported_datasets = ['wikitext2', 'ptb', 'c4']
 
@@ -74,7 +76,7 @@ def parser_gen():
 
     # General Arguments
     parser.add_argument('--model', type=str, default='meta-llama/Llama-2-7b-hf',
-                        help='Model to load;', choices=supported_models)
+                        help=f'Model name or local path. Examples: {supported_models}')
     parser.add_argument('--seed', type=int, default=0, help='Random Seed for HuggingFace and PyTorch')
     parser.add_argument('--eval_dataset', type=str, default='wikitext2',
                         help='Dataset for Evaluation (default: wikitext2)', choices=supported_datasets,)
@@ -103,8 +105,12 @@ def parser_gen():
                         help='ASymmetric Activation quantization (default: False)')
     parser.add_argument('--a_clip_ratio', type=float, default=1.0,
         help='Clip ratio for activation quantization. new_max = max * clip_ratio')
+    parser.add_argument('--a_per_tensor', action=argparse.BooleanOptionalAction, default=False,
+                        help='Per-tensor activation quantization (paper 4.1). Default is per-token.')
     parser.add_argument('--enable_aq_calibration', action=argparse.BooleanOptionalAction, default=False,
                         help='Enable activation quantization in GPTQ(v2) (default: False)')
+    parser.add_argument('--dataset_dir', type=str, default=None,
+                        help='Local directory for WikiText-2 (save_to_disk or parquet).')
 
     # Weight Quantization Arguments
     parser.add_argument('--w_bits', type=int, default=16, 
@@ -118,6 +124,14 @@ def parser_gen():
     parser.add_argument('--w_clip', action=argparse.BooleanOptionalAction, default=False,
                         help='''Clipping the weight quantization! 
                         We do not support arguments for clipping and we find the best clip ratio during the weight quantization''')
+    parser.add_argument('--w_format', type=str, default='int', choices=['int', 'nvfp4'],
+                        help='Weight grid: int (affine INT) or nvfp4 (E2M1 + fp8 scale).')
+    parser.add_argument('--a_format', type=str, default='int', choices=['int', 'nvfp4'],
+                        help='Activation grid: int or nvfp4. W4A4 NVFP4 uses both nvfp4.')
+    parser.add_argument('--seqlen', type=int, default=None,
+                        help='Override model.seqlen for calibration and PPL (default: model default).')
+    parser.add_argument('--eval_nsamples', type=int, default=None,
+                        help='Evaluate only the first N WikiText windows (smoke). Default: all.')
     parser.add_argument('--nsamples', type=int, default=128,
                         help='Number of calibration data samples for GPTQ.')
     parser.add_argument('--cal_dataset', type=str, default='wikitext2',
@@ -130,6 +144,29 @@ def parser_gen():
                         help='static groups in GPT(A)Q')
     parser.add_argument('--asym_calibrate', action=argparse.BooleanOptionalAction, default=False,
                         help='enable GPTAQ asymmetric calibration')
+
+    # ReQuant (arXiv:2608.07019) — fixed-grid discrete refinement
+    parser.add_argument('--requant', action=argparse.BooleanOptionalAction, default=False,
+                        help='Apply ReQuant after the PTQ initializer (Algorithm 1).')
+    parser.add_argument('--requant_sweeps', type=int, default=4,
+                        help='Number of coordinate sweeps T (paper default: 4).')
+    parser.add_argument('--requant_neighborhood', type=int, default=2,
+                        help='Neighborhood size K (paper default: 2).')
+    parser.add_argument('--requant_fp_branch', type=str, default='true_fp',
+                        choices=['true_fp', 'gptaq_local'],
+                        help='Source of X in Eq.5. true_fp uses a frozen FP weight snapshot.')
+    parser.add_argument('--requant_objective', type=str, default='full',
+                        choices=['full', 'simplified'],
+                        help='full = Eq.5 ||WX - W_q X~||^2; simplified drops the cross term.')
+    parser.add_argument('--requant_cross_alpha', type=float, default=1.0,
+                        help='Scale on the Eq.5 cross term (GPTAQ uses 0.25 for its analogue).')
+    parser.add_argument('--requant_coord_order', type=str, default='forward',
+                        choices=['forward', 'reverse', 'random'],
+                        help='Within-row column order. Paper default is forward (j=1..dcol).')
+    parser.add_argument('--requant_chunk', type=int, default=32,
+                        help='Calibration chunk size for the paired FP / quantized pass.')
+    parser.add_argument('--requant_offload_activations', action=argparse.BooleanOptionalAction, default=False,
+                        help='Keep inps/fp_inps on CPU and move chunks to GPU on demand.')
 
     # General Quantization Arguments
     parser.add_argument('--int8_down_proj', action=argparse.BooleanOptionalAction, default=False,
@@ -207,6 +244,29 @@ def parser_gen():
     
     # assert args.a_groupsize == args.w_groupsize, 'a_groupsize should be the same as w_groupsize!'
     assert args.k_pre_rope == False, 'Pre-RoPE quantization is not supported yet!'
+    if args.w_format == 'nvfp4':
+        assert args.w_bits == 4, 'NVFP4 weights require --w_bits 4.'
+        if args.w_asym:
+            logging.warning('NVFP4 is symmetric; --w_asym is ignored.')
+        if args.w_clip:
+            logging.warning('NVFP4 RTN does not use --w_clip MSE search.')
+        if args.w_groupsize != -1:
+            logging.warning('NVFP4 uses group_size=16; --w_groupsize is ignored.')
+        args.w_groupsize = -1
+    if args.a_format == 'nvfp4':
+        assert args.a_bits == 4, 'NVFP4 activations require --a_bits 4.'
+        if args.a_asym:
+            logging.warning('NVFP4 activations are symmetric; --a_asym is ignored.')
+        args.a_groupsize = 16
+        args.a_per_tensor = False
+    if args.requant:
+        assert args.w_bits < 16, 'ReQuant requires quantized weights (w_bits < 16).'
+        if args.w_format == 'int':
+            assert args.w_groupsize == -1, 'ReQuant INT path only supports per-channel weights (w_groupsize=-1).'
+        assert args.requant_sweeps >= 1, 'requant_sweeps T must be >= 1.'
+        assert args.requant_neighborhood >= 1, 'requant_neighborhood K must be >= 1.'
+    if not args.w_rtn and args.w_format == 'nvfp4' and args.w_bits < 16:
+        raise NotImplementedError('NVFP4 currently supports RTN only (--w_rtn).')
 
     if args.model == 'facebook/opt-125m' or args.model == 'facebook/opt-1.3b':
         logging.warning('Warning: OPT-125M/1.3B is only for debugging purposes!!')

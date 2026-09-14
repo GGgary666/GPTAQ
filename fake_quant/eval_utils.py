@@ -12,10 +12,10 @@ def evaluator(model, testenc, dev, args):
 
     model.eval()
 
-    if 'opt' in args.model:
+    if 'opt' in args.model.lower():
         opt_type = True
         llama_type = False
-    elif 'meta' in args.model:
+    elif model_utils.is_llama_like_name(args.model):
         llama_type = True
         opt_type = False
     else:
@@ -36,12 +36,15 @@ def evaluator(model, testenc, dev, args):
     elif llama_type:
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model_utils.maybe_move_rotary(model, dev)
 
     layers[0] = layers[0].to(dev)
 
     # Convert the whole text of evaluation dataset into batches of sequences.
     input_ids = testenc.input_ids  # (1, text_len)
     nsamples = input_ids.numel() // model.seqlen  # The tail is truncated.
+    if getattr(args, 'eval_nsamples', None):
+        nsamples = min(nsamples, int(args.eval_nsamples))
     input_ids = input_ids[:, :nsamples * model.seqlen].view(nsamples, model.seqlen).to(dev)  # (nsamples, seqlen)
 
     batch_size = args.bsz
@@ -54,7 +57,7 @@ def evaluator(model, testenc, dev, args):
         (nbatches, batch_size, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
     inps = [0] * nbatches
-    cache = {'i': 0, 'attention_mask': None}
+    cache = {'i': 0, 'layer_kwargs': {}}
     class Catcher(torch.nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -62,9 +65,7 @@ def evaluator(model, testenc, dev, args):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            if llama_type:
-                cache['position_ids'] = kwargs['position_ids']
+            cache['layer_kwargs'] = kwargs
             raise ValueError
     layers[0] = Catcher(layers[0])
    
@@ -86,11 +87,10 @@ def evaluator(model, testenc, dev, args):
             model.model.decoder.project_in = model.model.decoder.project_in.cpu()
     elif llama_type:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
-        position_ids = cache['position_ids']
 
     torch.cuda.empty_cache()
     outs = [0] * nbatches
-    attention_mask = cache['attention_mask']
+    layer_kwargs = cache['layer_kwargs']
 
     for i in tqdm(range(len(layers)), desc="(Eval) Layers"):
         layer = layers[i].to(dev)
@@ -104,10 +104,9 @@ def evaluator(model, testenc, dev, args):
             logging.info(f'Dumped layer input and output to: {save_path}')
 
         for j in range(nbatches):
-            if opt_type:
-                outs[j] = layer(inps[j], attention_mask=attention_mask)[0]
-            elif llama_type:
-                outs[j] = layer(inps[j], attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = model_utils.forward_decoder_layer(
+                layer, inps[j], layer_kwargs, model
+            )
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
