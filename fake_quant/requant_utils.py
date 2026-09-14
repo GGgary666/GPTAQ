@@ -444,63 +444,59 @@ def requant_fwrd(model, dataloader, dev, args, quantizers, fp_weights):
         layer = layers[i].to(dev)
         full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
         names = [n for n in full if 'lm_head' not in n]
-        q_weights = {n: full[n].weight.data.detach().clone() for n in names}
 
-        rq = {}
-        for name in names:
-            rq[name] = ReQuant(full[name])
+        # Groups must be refined one at a time, as GPTAQ does. A group's X̃ has
+        # to be measured with every earlier group already refined, or the Eq.5
+        # cross term cancels a drift that no longer exists by the time the layer
+        # runs, and coordinate descent trades away real weight fidelity for it.
+        groups = [[n for n in g if n in names] for g in SEQUENTIAL]
+        groups = [g for g in groups if g]
+        uncovered = set(names) - {n for g in groups for n in g}
+        if uncovered:
+            raise ValueError(f'Linear layers outside SEQUENTIAL would go unrefined: {sorted(uncovered)}')
 
-        # Modules within a SEQUENTIAL group share an input, so only the first of
-        # each group needs statistics; the rest copy them below.
-        collectors = [g[0] for g in SEQUENTIAL if any(n in rq for n in g)]
+        for gi, subset in enumerate(groups):
+            first = subset[0]
+            rq = {n: ReQuant(full[n]) for n in subset}
+            # The FP branch never sees a refined weight, so re-running it per
+            # group is redundant but harmless; only the final group may advance
+            # fp_inps, since the earlier ones still need to read it.
+            advance_fp = gi == len(groups) - 1
+            live = {n: full[n].weight.data.detach().clone() for n in names}
 
-        for start in range(0, nsamples, chunk):
-            end = min(start + chunk, nsamples)
-            fp_cache = {n: [] for n in collectors}
+            for start in range(0, nsamples, chunk):
+                end = min(start + chunk, nsamples)
+                fp_cache = {first: []}
 
-            bits_config = quant_utils.disable_act_quant(layer)
-            if fp_branch == 'true_fp':
-                _apply_weight_dict({n: full[n] for n in names}, fp_weights, layer_idx=i)
-            handles = [
-                full[name].register_forward_hook(_cache_fp_input(fp_cache, name))
-                for name in collectors
-            ]
-            for j in range(start, end):
-                x = _maybe_to(fp_inps[j], dev).unsqueeze(0)
-                y = model_utils.forward_decoder_layer(layer, x, layer_kwargs, model)
-                fp_inps[j] = _maybe_to(y.squeeze(0), act_device)
-            for h in handles:
+                bits_config = quant_utils.disable_act_quant(layer)
+                if fp_branch == 'true_fp':
+                    _apply_weight_dict({n: full[n] for n in names}, fp_weights, layer_idx=i)
+                h = full[first].register_forward_hook(_cache_fp_input(fp_cache, first))
+                for j in range(start, end):
+                    x = _maybe_to(fp_inps[j], dev).unsqueeze(0)
+                    y = model_utils.forward_decoder_layer(layer, x, layer_kwargs, model)
+                    if advance_fp:
+                        fp_inps[j] = _maybe_to(y.squeeze(0), act_device)
                 h.remove()
 
-            for n in names:
-                full[n].weight.data.copy_(q_weights[n])
-            quant_utils.enable_act_quant(layer, bits_config)
+                for n in names:
+                    full[n].weight.data.copy_(live[n])
+                quant_utils.enable_act_quant(layer, bits_config)
 
-            # Weights are frozen until every chunk has been consumed, so all
-            # groups can be hooked during a single pass over the chunk.
-            handles = []
-            for name in collectors:
                 consumed = {'k': 0}
 
-                def add_batch(_module, inp, _out, first_name=name, bucket=consumed):
+                def add_batch(_module, inp, _out, bucket=consumed, key=first):
                     x_q = _flatten_quant_input(inp[0].data)
                     idx = bucket['k']
                     bucket['k'] = idx + 1
-                    rq[first_name].add_batch(x_q, fp_cache[first_name][idx])
+                    rq[key].add_batch(x_q, fp_cache[key][idx])
 
-                handles.append(full[name].register_forward_hook(add_batch))
-            for j in range(start, end):
-                x = _maybe_to(inps[j], dev).unsqueeze(0)
-                y = model_utils.forward_decoder_layer(layer, x, layer_kwargs, model)
-                outs[j] = _maybe_to(y.squeeze(0), act_device)
-            for h in handles:
+                h = full[first].register_forward_hook(add_batch)
+                for j in range(start, end):
+                    x = _maybe_to(inps[j], dev).unsqueeze(0)
+                    model_utils.forward_decoder_layer(layer, x, layer_kwargs, model)
                 h.remove()
 
-        for group in SEQUENTIAL:
-            subset = [n for n in group if n in rq]
-            if len(subset) < 2:
-                continue
-            first = subset[0]
             for name in subset[1:]:
                 rq[name].H = rq[first].H
                 rq[name].B = rq[first].B
@@ -509,40 +505,43 @@ def requant_fwrd(model, dataloader, dev, args, quantizers, fp_weights):
                 rq[name].delta_sq = rq[first].delta_sq
                 rq[name].input_sq = rq[first].input_sq
 
-        for name in names:
-            qkey = f'model.layers.{i}.{name}'
-            if qkey not in quantizers:
-                logging.warning('No quantizer for %s; skip', qkey)
-                continue
-            cross_B = rq[name].B
-            if getattr(args, 'requant_objective', 'full') == 'simplified':
-                cross_B = None
-            elif getattr(args, 'requant_cross_alpha', 1.0) != 1.0:
-                cross_B = cross_B * float(args.requant_cross_alpha)
-            w_ref, loss0, loss1 = refine_weight(
-                fp_weights[qkey],
-                full[name].weight.data,
-                rq[name].H,
-                cross_B,
-                quantizers[qkey],
-                sweeps=args.requant_sweeps,
-                neighborhood=args.requant_neighborhood,
-                coord_order=args.requant_coord_order,
-                seed=args.seed,
-                drift_C=rq[name].C,
-            )
-            full[name].weight.data.copy_(w_ref.to(dtype=full[name].weight.dtype))
-            # quad is the weight-only error ReQuant can actually remove; const is
-            # the drift inherited from earlier layers, which it cannot.
-            logging.info(
-                '  %s: L %.4g -> %.4g  [quad %.4g -> %.4g, cross %.4g -> %.4g, '
-                'const %.4g]  |dX|/|X~| = %.3f',
-                name, loss0[0], loss1[0], loss0[1], loss1[1], loss0[2], loss1[2],
-                loss0[3], rq[name].relative_drift(),
-            )
-        for name in names:
-            rq[name].free()
+            for name in subset:
+                qkey = f'model.layers.{i}.{name}'
+                if qkey not in quantizers:
+                    logging.warning('No quantizer for %s; skip', qkey)
+                    continue
+                cross_B = rq[name].B
+                if getattr(args, 'requant_objective', 'full') == 'simplified':
+                    cross_B = None
+                elif getattr(args, 'requant_cross_alpha', 1.0) != 1.0:
+                    cross_B = cross_B * float(args.requant_cross_alpha)
+                w_ref, loss0, loss1 = refine_weight(
+                    fp_weights[qkey],
+                    full[name].weight.data,
+                    rq[name].H,
+                    cross_B,
+                    quantizers[qkey],
+                    sweeps=args.requant_sweeps,
+                    neighborhood=args.requant_neighborhood,
+                    coord_order=args.requant_coord_order,
+                    seed=args.seed,
+                    drift_C=rq[name].C,
+                )
+                full[name].weight.data.copy_(w_ref.to(dtype=full[name].weight.dtype))
+                # quad is the weight-only error ReQuant can actually remove;
+                # const is the drift inherited from earlier layers, which it
+                # cannot. quad going up means the trade has gone bad.
+                logging.info(
+                    '  %s: L %.4g -> %.4g  [quad %.4g -> %.4g, cross %.4g -> %.4g, '
+                    'const %.4g]  |dX|/|X~| = %.3f',
+                    name, loss0[0], loss1[0], loss0[1], loss1[1], loss0[2], loss1[2],
+                    loss0[3], rq[name].relative_drift(),
+                )
+            for name in subset:
+                rq[name].free()
 
+        # inps still holds this layer's input, so one more pass is needed to
+        # propagate the quantized branch through every refined group.
         for j in range(nsamples):
             x = _maybe_to(inps[j], dev).unsqueeze(0)
             y = model_utils.forward_decoder_layer(layer, x, layer_kwargs, model)

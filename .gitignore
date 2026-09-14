@@ -45,6 +45,9 @@ fake_quant/scripts/
 # Local experiment outputs
 fake_quant/runs/
 
+# Internal notes: same content as the public docs plus cluster paths and host names
+*.internal.md
+
 # Ignore ImageNet Pre-trained Models #
 ######################################
 *ImageNet/checkpoint/*
